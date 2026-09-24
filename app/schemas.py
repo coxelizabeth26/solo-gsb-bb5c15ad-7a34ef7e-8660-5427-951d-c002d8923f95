@@ -507,3 +507,54 @@ class InstallmentPlanResult(BaseModel):
     uncovered_total: str
     overdue_total: str
     installments: list[InstallmentOut]
+
+
+# ---- 供应商发票号码批次查重 ----
+
+
+class InvoiceNumberCheckItem(BaseModel):
+    """查重批次中的一条记录：供应商编号 + 供应商发票号码。"""
+
+    supplier_code: str = Field(
+        description="供应商编号；为空（去除首尾空白后）返回 422；查重按 NFKC 规范化、"
+        "去首尾空白并大小写折叠后的值分组"
+    )
+    invoice_number: str = Field(
+        description="供应商发票号码；原始值为空（去除首尾空白后）或超过 100 个 Unicode 字符"
+        "返回 422；查重按 NFKC 规范化、去首尾空白并大小写折叠后的值比较"
+    )
+
+
+class InvoiceNumberCheckCreate(BaseModel):
+    """供应商发票号码批次查重请求（1~500 条）。"""
+
+    items: list[InvoiceNumberCheckItem] = Field(
+        min_length=1,
+        max_length=500,
+        description="待查重记录，1~500 条；仅在同一供应商（规范化供应商编号）内识别重复",
+    )
+
+
+class InvoiceNumberOccurrence(BaseModel):
+    """一个重复号码的某次输入：输入位置（1 起始）与原始发票号码。"""
+
+    model_config = ConfigDict(extra="allow")
+    position: int
+    raw_value: str
+
+
+class InvoiceNumberDuplicateGroup(BaseModel):
+    """同一供应商内规范化后相同的发票号码重复组（≥2 次出现）。"""
+
+    model_config = ConfigDict(extra="allow")
+    supplier_code: str
+    invoice_number: str
+    occurrences: list[InvoiceNumberOccurrence]
+
+
+class InvoiceNumberCheckResult(BaseModel):
+    """查重结果：重复组按其在输入中的首次出现顺序排列，未重复号码不列出。"""
+
+    items: list[InvoiceNumberDuplicateGroup]
+    total: int = Field(description="提交的记录条数")
+    duplicate_groups: int = Field(description="识别出的重复组数")

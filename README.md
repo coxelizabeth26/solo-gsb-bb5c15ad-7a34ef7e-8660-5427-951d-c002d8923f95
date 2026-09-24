@@ -12,6 +12,7 @@
 - **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
 - **历史收款快照**：`GET /api/v1/invoices/{id}/payment-snapshot?at=...` 返回单张发票在指定 UTC 时点（必填、秒精度 `YYYY-MM-DDTHH:MM:SSZ`，截止秒为闭区间、同秒流水全部计入）的收款总额、冲销总额、净已收与未收余额；只统计该时点之前及当秒的流水，截止后的流水不改变历史结果，金额全程按发票币种最小单位用 `Decimal` 计算。
 - **分期回款计划**：`POST /api/v1/invoices/{id}/installment-plan` 为单张发票创建**唯一一份**分期计划，提交按到期日升序排列的期次与金额（每期为币种最小单位的正数，期次合计须等于含税总额，校验与写入在同一 SQLite 事务内完成）；`GET .../installment-plan?as_of=...` 查询时把当前**净已收额（收款 − 冲销）按期次顺序逐期 FIFO 抵扣**，返回每期已覆盖额、未覆盖额，仅到期日严格早于查询日（缺省 UTC 当日）的未覆盖额计为逾期额。冲销后再查自动反映重新打开的期次，**原计划永不改写**。
+- **供应商发票号码批次查重**：`POST /api/v1/invoice-number-check` 接收 1~500 条「供应商编号 + 发票号码」，服务端对每个字段做 **Unicode NFKC 规范化、去除首尾空白并按大小写折叠**，仅在**同一供应商**（按规范化供应商编号分组）内识别规范化后重复的号码；响应按各组在输入中的首次出现顺序返回供应商、规范化号码、所有输入位置与原始值，未重复号码不列出。纯内存计算，不落库。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
 - 内置 OpenAPI 交互文档（Swagger UI / ReDoc）。
 
@@ -98,6 +99,15 @@ curl -s -X POST http://localhost:8000/api/v1/invoices/1/installment-plan \
 
 # 查询分期计划（as_of 缺省取 UTC 当前日期；仅到期日严格早于 as_of 的未覆盖额计逾期）
 curl -s 'http://localhost:8000/api/v1/invoices/1/installment-plan?as_of=2026-10-15'
+
+# 供应商发票号码批次查重（同一供应商内识别规范化后重复的号码）
+curl -s -X POST http://localhost:8000/api/v1/invoice-number-check \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [
+    {"supplier_code": "SUP-001", "invoice_number": "INV-001"},
+    {"supplier_code": "SUP-001", "invoice_number": " inv-001 "},
+    {"supplier_code": "SUP-002", "invoice_number": "INV-001"}
+  ]}'
 ```
 
 > 以上命令要求服务已启动：在仓库根目录执行 `docker compose up -d --build`（见下一节）。
@@ -195,6 +205,7 @@ Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
 | `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201` |
 | `POST` | `/api/v1/invoices/{id}/installment-plan` | 为单张发票创建唯一一份分期回款计划（期次按到期日升序、合计等于含税总额），`201`；已存在计划 `409` |
 | `GET` | `/api/v1/invoices/{id}/installment-plan?as_of=...` | 查询分期计划：净已收额逐期 FIFO 抵扣，返回每期已覆盖/未覆盖/逾期额；无计划 `404` |
+| `POST` | `/api/v1/invoice-number-check` | 供应商发票号码批次查重（1~500 条，NFKC 规范化后同一供应商内查重，纯内存计算） |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
 
 ### 3.1 创建发票 `POST /api/v1/invoices`
@@ -667,13 +678,77 @@ curl -s 'http://localhost:8000/api/v1/invoices/1/installment-plan?as_of=2026-10-
 2.00 / 未覆盖 11.11（逾期 11.11），第 3 期全额重新打开；`installments[].amount`
 与 `due_date` 与创建时完全一致。0 位小数币种（JPY 等）金额同样不带小数位。
 
-### 3.9 错误码
+### 3.9 供应商发票号码批次查重 `POST /api/v1/invoice-number-check`
+
+批量识别**同一供应商内**重复的发票号码（纯内存计算，不写数据库）。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `items` | array | 是 | 待查重记录，**1~500 条**；为空或超过 500 条返回 `422` |
+| `items[].supplier_code` | string | 是 | 供应商编号；为空（去除首尾空白后）返回 `422` |
+| `items[].invoice_number` | string | 是 | 供应商发票号码；原始值为空（去除首尾空白后）或**超过 100 个 Unicode 字符**（按原始值计）返回 `422` |
+
+规范化与查重规则：
+
+1. 每个字段先做 **Unicode NFKC 规范化**（全角字符、兼容字符等归一），
+   再**去除首尾空白**，最后**按大小写折叠**（casefold），得到用于比较的规范化值。
+2. 按**规范化后的供应商编号**分组，仅在**同一供应商内**比较：规范化后相同的
+   发票号码出现 2 次及以上即构成一个重复组；跨供应商的相同号码不算重复。
+3. 响应中的重复组按其在输入中的**首次出现顺序**排列；组内 `occurrences` 按
+   输入顺序升序，给出 1 起始的输入位置 `position` 与提交时的原始号码
+   `raw_value`；**未重复的号码不列出**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/invoice-number-check \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [
+    {"supplier_code": "SUP-001", "invoice_number": "INV-001"},
+    {"supplier_code": " sup-001 ", "invoice_number": " inv-001 "},
+    {"supplier_code": "SUP-002", "invoice_number": "INV-001"},
+    {"supplier_code": "SUP-002", "invoice_number": "ＩＮＶ－１２３"},
+    {"supplier_code": "SUP-002", "invoice_number": "inv-123"}
+  ]}'
+```
+
+响应 `200`（全角号码 `ＩＮＶ－１２３` 经 NFKC 规范化后与 `inv-123` 视为相同；
+第 3 条与第 1、2 条号码相同但供应商不同，不构成重复）：
+
+```json
+{
+  "items": [
+    {
+      "supplier_code": "sup-001",
+      "invoice_number": "inv-001",
+      "occurrences": [
+        {"position": 1, "raw_value": "INV-001"},
+        {"position": 2, "raw_value": " inv-001 "}
+      ]
+    },
+    {
+      "supplier_code": "sup-002",
+      "invoice_number": "inv-123",
+      "occurrences": [
+        {"position": 4, "raw_value": "ＩＮＶ－１２３"},
+        {"position": 5, "raw_value": "inv-123"}
+      ]
+    }
+  ],
+  "total": 5,
+  "duplicate_groups": 2
+}
+```
+
+无重复时 `items` 为空数组、`duplicate_groups` 为 `0`；`total` 回显提交条数。
+
+### 3.10 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
 | `404` | 发票 id 不存在（含单张收款登记/查询、历史快照、分期计划创建/查询、来款分配时列表中任一 id 不存在）；发票尚未创建分期计划时查询计划；冲销时收款流水 `payment_id` 不存在 |
 | `409` | 为已存在分期回款计划的发票再次创建计划（每张发票只允许一份） |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、分期期次为空、期次到期日未按升序排列、期次金额 ≤ 0 或非最小单位正整数倍、期次合计不等于含税总额、历史快照的 `at` 缺失或不是合法 UTC 秒精度时间（`YYYY-MM-DDTHH:MM:SSZ`）或早于发票创建时间、分页参数越界等（响应体 `detail` 为中文说明或 FastAPI 校验错误列表） |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、分期期次为空、期次到期日未按升序排列、期次金额 ≤ 0 或非最小单位正整数倍、期次合计不等于含税总额、历史快照的 `at` 缺失或不是合法 UTC 秒精度时间（`YYYY-MM-DDTHH:MM:SSZ`）或早于发票创建时间、查重批次为空或超过 500 条、供应商编号为空、发票号码为空或超过 100 个 Unicode 字符、分页参数越界等（响应体 `detail` 为中文说明或 FastAPI 校验错误列表） |
 
 ---
 
@@ -718,7 +793,9 @@ python -m unittest tests.test_calc -v
 # 来款分配排序/整笔拒绝/分配与单张收款混合并发不超收、
 # 收款冲销分次/超额 422 不留记录/并发冲销不超额/冲销后余额回升再分配、
 # 历史收款快照（截止秒闭区间/同秒流水/截止后流水不改变历史/格式与早于发票创建 422/404）、
-# 分期回款计划（FIFO 逐期抵扣/逾期额按查询日/冲销重新打开/合计与升序校验/每发票唯一 409/JPY/并发创建）、持久化）
+# 分期回款计划（FIFO 逐期抵扣/逾期额按查询日/冲销重新打开/合计与升序校验/每发票唯一 409/JPY/并发创建）、
+# 供应商发票号码批次查重（NFKC 规范化 + 大小写折叠、同一供应商内查重、
+# 组按首次出现顺序/位置与原始值、空值与超长 422、条数 1~500、跨供应商不重复）、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -729,10 +806,11 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 历史收款快照 / 收款冲销 / 来款分配 / 分期回款计划
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 历史收款快照 / 收款冲销 / 来款分配 / 分期回款计划 / 供应商发票号码批次查重
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配 / 历史快照 / 分期计划模型）
+│   ├── invoice_check.py  # 供应商发票号码查重核心：NFKC 规范化 + 大小写折叠，同一供应商内分组查重（纯函数）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配 / 历史快照 / 分期计划 / 查重模型）
 │   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配 + 分期计划）/ 查询（含逾期、历史快照与分期 FIFO 抵扣，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测

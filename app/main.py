@@ -18,11 +18,14 @@ from fastapi.responses import JSONResponse
 from . import db as database
 from .calc import compute_invoice, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
+from .invoice_check import find_duplicate_invoice_numbers
 from .schemas import (
     Health,
     InstallmentPlanCreate,
     InstallmentPlanResult,
     InvoiceCreate,
+    InvoiceNumberCheckCreate,
+    InvoiceNumberCheckResult,
     InvoiceResult,
     PagedInvoices,
     PagedOverdueInvoices,
@@ -49,7 +52,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -57,7 +60,8 @@ app = FastAPI(
         "一笔来款在多张同币种待结发票间按到期日顺序分配、"
         "到期日（due_date）与逾期发票分页查询、"
         "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
-        "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算），"
+        "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算）、"
+        "供应商发票号码批次查重（NFKC 规范化、同一供应商内查重），"
         "SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -463,3 +467,31 @@ def read_installment_plan(
     return database.installment_plan_status(
         conn, row, int(plan["id"]), plan["created_at"], item_rows, cutoff
     )
+
+
+# ---- 供应商发票号码批次查重 ----
+
+
+@app.post(
+    "/api/v1/invoice-number-check",
+    response_model=InvoiceNumberCheckResult,
+    tags=["invoice-number-check"],
+)
+def check_invoice_numbers(payload: InvoiceNumberCheckCreate) -> dict[str, Any]:
+    """批量识别同一供应商内重复的发票号码（纯内存计算，不落库）。
+
+    接收 1~500 条 ``(供应商编号, 发票号码)`` 记录；服务端对每个字段做
+    Unicode NFKC 规范化、去除首尾空白并按大小写折叠，仅在**同一供应商**
+    （按规范化供应商编号分组）内识别规范化后重复的号码。原始号码为空、
+    超过 100 个 Unicode 字符或供应商编号为空返回 422（走全局
+    ValueError -> 422 处理器）。响应按各组在输入中的首次出现顺序返回
+    供应商、规范化号码、所有输入位置（1 起始）与原始值，未重复号码不列出。
+    """
+
+    items = [(item.supplier_code, item.invoice_number) for item in payload.items]
+    duplicates = find_duplicate_invoice_numbers(items)
+    return {
+        "items": duplicates,
+        "total": len(items),
+        "duplicate_groups": len(duplicates),
+    }

@@ -1581,6 +1581,146 @@ class ApiTests(unittest.TestCase):
             t.join()
         self.assertEqual(sorted(codes), [201] + [409] * 7)
 
+    def test_26_invoice_number_check(self) -> None:
+        path = "/api/v1/invoice-number-check"
+
+        # 基础查重：大小写、首尾空白、全角/兼容字符经规范化后在同一供应商内重复；
+        # 跨供应商相同号码不算重复；未重复号码不列出
+        payload = {
+            "items": [
+                {"supplier_code": "SUP-001", "invoice_number": "INV-001"},
+                {"supplier_code": "SUP-002", "invoice_number": "UNIQUE-1"},
+                {"supplier_code": " sup-001 ", "invoice_number": " inv-001 "},
+                {"supplier_code": "SUP-001", "invoice_number": "INV-001"},
+                # 全角字母数字（NFKC 后等价）+ 全角空格
+                {"supplier_code": "ＳＵＰ－００２", "invoice_number": "ＩＮＶ－１２３"},
+                {"supplier_code": "SUP-002", "invoice_number": "inv-123"},
+            ]
+        }
+        status, body = self._request("POST", path, payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 6)
+        self.assertEqual(body["duplicate_groups"], 2)
+        self.assertEqual(
+            body["items"],
+            [
+                {
+                    "supplier_code": "sup-001",
+                    "invoice_number": "inv-001",
+                    "occurrences": [
+                        {"position": 1, "raw_value": "INV-001"},
+                        {"position": 3, "raw_value": " inv-001 "},
+                        {"position": 4, "raw_value": "INV-001"},
+                    ],
+                },
+                {
+                    "supplier_code": "sup-002",
+                    "invoice_number": "inv-123",
+                    "occurrences": [
+                        {"position": 5, "raw_value": "ＩＮＶ－１２３"},
+                        {"position": 6, "raw_value": "inv-123"},
+                    ],
+                },
+            ],
+        )
+
+        # 无重复：items 为空数组
+        status, body = self._request(
+            "POST",
+            path,
+            {"items": [
+                {"supplier_code": "A", "invoice_number": "x"},
+                {"supplier_code": "B", "invoice_number": "x"},
+            ]},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["duplicate_groups"], 0)
+        self.assertEqual(body["total"], 2)
+
+        # 组顺序按首次出现顺序；同组位置按输入顺序
+        status, body = self._request(
+            "POST",
+            path,
+            {"items": [
+                {"supplier_code": "B", "invoice_number": "n2"},
+                {"supplier_code": "A", "invoice_number": "n1"},
+                {"supplier_code": "B", "invoice_number": "n2"},
+                {"supplier_code": "A", "invoice_number": "n1"},
+            ]},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            [(g["supplier_code"], g["invoice_number"]) for g in body["items"]],
+            [("b", "n2"), ("a", "n1")],
+        )
+        self.assertEqual(body["items"][0]["occurrences"][1]["position"], 3)
+
+        # 422：发票号码为空 / 纯空白
+        for bad in ("", "   ", "\t\n"):
+            status, resp = self._request(
+                "POST",
+                path,
+                {"items": [
+                    {"supplier_code": "S1", "invoice_number": "OK-1"},
+                    {"supplier_code": "S1", "invoice_number": bad},
+                ]},
+            )
+            self.assertEqual(status, 422, bad)
+            self.assertIn("发票号码为空", resp["detail"])
+
+        # 422：供应商编号为空
+        status, resp = self._request(
+            "POST",
+            path,
+            {"items": [{"supplier_code": " ", "invoice_number": "INV-1"}]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("供应商编号为空", resp["detail"])
+
+        # 422：发票号码超过 100 个 Unicode 字符（按原始值计）；100 个合法
+        status, resp = self._request(
+            "POST",
+            path,
+            {"items": [{"supplier_code": "S1", "invoice_number": "x" * 101}]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("100", resp["detail"])
+        status, _ = self._request(
+            "POST",
+            path,
+            {"items": [
+                {"supplier_code": "S1", "invoice_number": "发" * 100},
+                {"supplier_code": "S1", "invoice_number": "发" * 100},
+            ]},
+        )
+        self.assertEqual(status, 200)
+
+        # 422：批次条数越界（0 条 / 501 条）
+        status, _ = self._request("POST", path, {"items": []})
+        self.assertEqual(status, 422)
+        status, _ = self._request(
+            "POST",
+            path,
+            {"items": [
+                {"supplier_code": "S", "invoice_number": f"N{i}"} for i in range(501)
+            ]},
+        )
+        self.assertEqual(status, 422)
+
+        # 500 条（全在同一供应商、两两重复）合法
+        status, body = self._request(
+            "POST",
+            path,
+            {"items": [
+                {"supplier_code": "S", "invoice_number": f"N{i // 2}"}
+                for i in range(500)
+            ]},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 500)
+        self.assertEqual(body["duplicate_groups"], 250)
+
 
 if __name__ == "__main__":
     unittest.main()
