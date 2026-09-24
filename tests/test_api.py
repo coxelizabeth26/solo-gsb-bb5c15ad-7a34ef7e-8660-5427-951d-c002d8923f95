@@ -1581,6 +1581,140 @@ class ApiTests(unittest.TestCase):
             t.join()
         self.assertEqual(sorted(codes), [201] + [409] * 7)
 
+    def test_26_invoice_number_check_duplicates(self) -> None:
+        payload = {
+            "items": [
+                {"supplier_code": "SUP-A", "invoice_number": "INV-001"},
+                {"supplier_code": "sup-a", "invoice_number": " inv-001 "},
+                {"supplier_code": "SUP-A", "invoice_number": "INV-002"},
+                {"supplier_code": "SUP-B", "invoice_number": "INV-001"},
+            ]
+        }
+        status, body = self._request("POST", "/api/v1/invoice-number-check", payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            body,
+            {
+                "items": [
+                    {
+                        "supplier_code": "SUP-A",
+                        "normalized_invoice_number": "inv-001",
+                        "positions": [1, 2],
+                        "original_invoice_numbers": ["INV-001", " inv-001 "],
+                    }
+                ]
+            },
+        )
+
+    def test_27_invoice_number_check_normalization(self) -> None:
+        # NFKC（全角）+ 大小写折叠（Kelvin 符号 K → k；ß casefold → ss）
+        payload = {
+            "items": [
+                {"supplier_code": "ＳＵＰ－１", "invoice_number": "ＡＢＣ１２３"},
+                {"supplier_code": "SUP-1", "invoice_number": "abc123"},
+                {"supplier_code": "x", "invoice_number": "STRAßE"},
+                {"supplier_code": "x", "invoice_number": "strasse"},
+            ]
+        }
+        status, body = self._request("POST", "/api/v1/invoice-number-check", payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            [(g["normalized_invoice_number"], g["positions"]) for g in body["items"]],
+            [("abc123", [1, 2]), ("strasse", [3, 4])],
+        )
+
+    def test_28_invoice_number_check_group_ordering(self) -> None:
+        # 重复组按组内最早输入位置升序；同号码跨供应商不算重复
+        payload = {
+            "items": [
+                {"supplier_code": "a", "invoice_number": "z"},
+                {"supplier_code": "b", "invoice_number": "m"},
+                {"supplier_code": "a", "invoice_number": "z"},
+                {"supplier_code": "b", "invoice_number": "n"},
+                {"supplier_code": "b", "invoice_number": "m"},
+                {"supplier_code": "a", "invoice_number": "x"},
+                {"supplier_code": "a", "invoice_number": "x"},
+            ]
+        }
+        status, body = self._request("POST", "/api/v1/invoice-number-check", payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            [(g["supplier_code"], g["positions"]) for g in body["items"]],
+            [("a", [1, 3]), ("b", [2, 5]), ("a", [6, 7])],
+        )
+        # supplier_code 取首次出现位置的原始值
+        self.assertEqual(
+            [g["original_invoice_numbers"] for g in body["items"]],
+            [["z", "z"], ["m", "m"], ["x", "x"]],
+        )
+
+    def test_29_invoice_number_check_no_duplicates(self) -> None:
+        payload = {
+            "items": [
+                {"supplier_code": "a", "invoice_number": "1"},
+                {"supplier_code": "b", "invoice_number": "1"},
+                {"supplier_code": "a", "invoice_number": "2"},
+            ]
+        }
+        status, body = self._request("POST", "/api/v1/invoice-number-check", payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {"items": []})
+
+    def test_30_invoice_number_check_validation(self) -> None:
+        path = "/api/v1/invoice-number-check"
+
+        # 空批次
+        status, body = self._request("POST", path, {"items": []})
+        self.assertEqual(status, 422, body)
+
+        # 超过 500 条
+        big = {
+            "items": [
+                {"supplier_code": "s", "invoice_number": f"n{i}"} for i in range(501)
+            ]
+        }
+        status, body = self._request("POST", path, big)
+        self.assertEqual(status, 422, body)
+
+        # 原始发票号码为空 / 纯空白（NFKC 后为空）
+        for bad_number in ("", "   ", "\t\n", "\u3000"):  # 全角空格 NFKC 后为空
+            status, body = self._request(
+                "POST",
+                path,
+                {"items": [{"supplier_code": "s", "invoice_number": bad_number}]},
+            )
+            self.assertEqual(status, 422, (bad_number, body))
+
+        # 供应商编号为空
+        status, body = self._request(
+            "POST",
+            path,
+            {"items": [{"supplier_code": "  ", "invoice_number": "n"}]},
+        )
+        self.assertEqual(status, 422, body)
+
+        # 原始号码超过 100 个 Unicode 字符（每个 emoji 算 1 个字符）
+        status, body = self._request(
+            "POST",
+            path,
+            {"items": [{"supplier_code": "s", "invoice_number": "😀" * 101}]},
+        )
+        self.assertEqual(status, 422, body)
+
+        # 恰好 100 个字符合法
+        status, body = self._request(
+            "POST",
+            path,
+            {"items": [{"supplier_code": "s", "invoice_number": "a" * 100}]},
+        )
+        self.assertEqual(status, 200, body)
+
+        # 缺字段
+        status, body = self._request(
+            "POST", path, {"items": [{"supplier_code": "s"}]}
+        )
+        self.assertEqual(status, 422, body)
+
 
 if __name__ == "__main__":
     unittest.main()

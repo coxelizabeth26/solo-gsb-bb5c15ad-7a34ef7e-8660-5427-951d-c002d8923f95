@@ -18,11 +18,14 @@ from fastapi.responses import JSONResponse
 from . import db as database
 from .calc import compute_invoice, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
+from .duplicates import find_duplicates
 from .schemas import (
     Health,
     InstallmentPlanCreate,
     InstallmentPlanResult,
     InvoiceCreate,
+    InvoiceNumberCheckRequest,
+    InvoiceNumberCheckResult,
     InvoiceResult,
     PagedInvoices,
     PagedOverdueInvoices,
@@ -49,7 +52,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -57,7 +60,8 @@ app = FastAPI(
         "一笔来款在多张同币种待结发票间按到期日顺序分配、"
         "到期日（due_date）与逾期发票分页查询、"
         "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
-        "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算），"
+        "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算）、"
+        "供应商发票号码批次查重（NFKC 规范化后同供应商内判重）、"
         "SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -158,6 +162,39 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> Health:
     except Exception:  # pragma: no cover
         raise HTTPException(status_code=503, detail="database unavailable")
     return Health(status="ok", database="up")
+
+
+@app.post(
+    "/api/v1/invoice-number-check",
+    response_model=InvoiceNumberCheckResult,
+    tags=["invoice-number-check"],
+)
+def check_invoice_numbers(
+    payload: InvoiceNumberCheckRequest,
+) -> dict[str, Any]:
+    """供应商发票号码批次查重（1~500 条，无状态、不落库）。
+
+    对每个供应商编号与发票号码做 Unicode NFKC 规范化、去除首尾空白并按
+    大小写折叠，在**同一供应商内**识别规范化后重复的号码。原始号码为空、
+    超过 100 个 Unicode 字符或供应商编号为空返回 422；条目数越界、缺字段
+    同样返回 422。响应按输入首次出现顺序返回每个重复组的供应商（首次出现
+    位置的原始值）、规范化号码、所有输入位置（从 1 开始）及原始号码，
+    未重复号码不列出。
+    """
+
+    pairs = [(item.supplier_code, item.invoice_number) for item in payload.items]
+    groups = find_duplicates(pairs)
+    return {
+        "items": [
+            {
+                "supplier_code": group.supplier_code,
+                "normalized_invoice_number": group.normalized_invoice_number,
+                "positions": list(group.positions),
+                "original_invoice_numbers": list(group.original_invoice_numbers),
+            }
+            for group in groups
+        ]
+    }
 
 
 @app.post(

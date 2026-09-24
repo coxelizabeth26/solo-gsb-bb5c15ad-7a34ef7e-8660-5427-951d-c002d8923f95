@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .duplicates import MAX_INVOICE_NUMBER_CHARS, is_blank
+
 _DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$|^-?\.\d+$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ISO_UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -507,3 +509,62 @@ class InstallmentPlanResult(BaseModel):
     uncovered_total: str
     overdue_total: str
     installments: list[InstallmentOut]
+
+
+# ---- 供应商发票号码批次查重 ----
+
+
+class InvoiceNumberCheckItem(BaseModel):
+    """查重批次中的一条：供应商编号 + 供应商发票号码（原始值，原样回显）。"""
+
+    model_config = ConfigDict(extra="ignore")
+    supplier_code: str = Field(description="供应商编号；规范化（NFKC/去空白/折叠大小写）后不得为空")
+    invoice_number: str = Field(
+        description=f"供应商发票号码；不得为空，原始长度不超过 {MAX_INVOICE_NUMBER_CHARS} 个 Unicode 字符"
+    )
+
+
+class InvoiceNumberCheckRequest(BaseModel):
+    """供应商发票号码批次查重请求：1~500 条。"""
+
+    model_config = ConfigDict(extra="ignore")
+    items: list[InvoiceNumberCheckItem] = Field(
+        min_length=1,
+        max_length=500,
+        description="待查重条目，1~500 条；位置（positions）从 1 开始按输入顺序编号",
+    )
+
+    @field_validator("items")
+    @classmethod
+    def _check_items(cls, v: list[InvoiceNumberCheckItem]) -> list[InvoiceNumberCheckItem]:
+        for index, item in enumerate(v, start=1):
+            if is_blank(item.supplier_code):
+                raise ValueError(f"items[{index}].supplier_code 供应商编号不得为空")
+            if is_blank(item.invoice_number):
+                raise ValueError(f"items[{index}].invoice_number 原始号码不得为空")
+            if len(item.invoice_number) > MAX_INVOICE_NUMBER_CHARS:
+                raise ValueError(
+                    f"items[{index}].invoice_number 原始号码不得超过 "
+                    f"{MAX_INVOICE_NUMBER_CHARS} 个 Unicode 字符，"
+                    f"收到 {len(item.invoice_number)} 个"
+                )
+        return v
+
+
+class InvoiceNumberDuplicateGroup(BaseModel):
+    """一个重复组：同一供应商内规范化后相同的所有号码。"""
+
+    supplier_code: str = Field(description="供应商编号（组内首次出现位置的原始值）")
+    normalized_invoice_number: str = Field(
+        description="规范化后的发票号码（NFKC、去首尾空白、大小写折叠后）"
+    )
+    positions: list[int] = Field(description="组内每条记录的输入位置（从 1 开始，升序）")
+    original_invoice_numbers: list[str] = Field(
+        description="组内每条记录的原始发票号码（按 positions 顺序原样回显）"
+    )
+
+
+class InvoiceNumberCheckResult(BaseModel):
+    """查重响应：只包含重复组，按组内最早输入位置升序；无重复时为空列表。"""
+
+    items: list[InvoiceNumberDuplicateGroup]
